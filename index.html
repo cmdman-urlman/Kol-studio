@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<title>KOL Studio – Editor + Viewer</title>
+<style>
+body{margin:0;font-family:sans-serif;background:#0e0e0e;color:#eee;display:flex;height:100vh;touch-action:none}
+#ui{width:280px;background:#1b1b1b;padding:10px;display:flex;flex-direction:column;gap:8px}
+#stageWrap{flex:1;display:flex;justify-content:center;align-items:center}
+#stage{position:relative;width:640px;height:360px;background:#333;overflow:hidden}
+.layer{position:absolute;cursor:move}
+input,button{background:#2a2a2a;color:#eee;border:1px solid #555;padding:6px}
+button:hover{background:#3a3a3a}
+.handle{width:10px;height:10px;background:#fff;position:absolute;right:-5px;bottom:-5px;cursor:nwse-resize}
+#layers{font-size:12px}
+</style>
+</head>
+<body>
+<div id="ui" data-ui>
+  <b>KOL Studio</b>
+  <input type="color" id="bgColor">
+  <input type="file" id="fileInput" accept="image/*,video/*,.kol" multiple>
+  <label>Kesto (sek): <input type="number" id="duration" value="5" min="1"></label>
+  <button onclick="exportVideo()">🎥 Vie MP4 (auto)</button>
+  <button onclick="saveKOL()">💾 Tallenna .kol</button>
+  <input type="file" id="kolInput" accept=".kol">
+  <button onclick="startLive()">📺 Live (Firebase)</button>
+  <small id="liveInfo"></small>
+  <small id="warn" style="color:#ffb347"></small>
+  <b>Layerit</b>
+  <div id="layers"></div>
+</div>
+<div id="stageWrap"><div id="stage"></div></div>
+
+<script>
+const bc = new BroadcastChannel('kol-live');
+const stage = document.getElementById('stage');
+const layersDiv = document.getElementById('layers');
+const bgColor = document.getElementById('bgColor');
+const fileInput = document.getElementById('fileInput');
+const kolInput = document.getElementById('kolInput');
+const duration = document.getElementById('duration');
+const liveInfo = document.getElementById('liveInfo');
+const warn = document.getElementById('warn');
+
+let layers = [];
+
+bgColor.oninput = () => update(() => stage.style.background = bgColor.value);
+
+fileInput.onchange = async e => {
+  const files = [...e.target.files];
+  for (const f of files) {
+    if (f.name.endsWith('.kol')) {
+      const txt = await f.text();
+      load(JSON.parse(txt));
+      continue;
+    }
+    const url = URL.createObjectURL(f);
+    const el = f.type.startsWith('video') ? document.createElement('video') : document.createElement('img');
+    el.src = url;
+    if (el.tagName === 'VIDEO') {
+      el.autoplay = true;
+      el.loop = true;
+      el.muted = true;
+    }
+    el.className = 'layer';
+    el.style.left = '50px';
+    el.style.top = '50px';
+    el.style.width = '200px';
+    addHandles(el);
+    drag(el);
+    stage.appendChild(el);
+    layers.push(el);
+  }
+  refreshLayers();
+  update();
+};
+
+function drag(el) {
+  let ox, oy;
+  el.onpointerdown = e => {
+    el.setPointerCapture(e.pointerId);
+    ox = e.clientX - parseInt(el.style.left);
+    oy = e.clientY - parseInt(el.style.top);
+    el.onpointermove = p => {
+      el.style.left = p.clientX - ox + 'px';
+      el.style.top = p.clientY - oy + 'px';
+      update();
+    };
+    el.onpointerup = () => {
+      el.onpointermove = null;
+    };
+  };
+}
+
+function addHandles(el) {
+  const h = document.createElement('div');
+  h.className = 'handle';
+  el.appendChild(h);
+  h.onpointerdown = e => {
+    e.stopPropagation();
+    const startW = el.offsetWidth;
+    const sx = e.clientX;
+    h.setPointerCapture(e.pointerId);
+    h.onpointermove = p => {
+      el.style.width = startW + (p.clientX - sx) + 'px';
+      update();
+    };
+    h.onpointerup = () => h.onpointermove = null;
+  };
+}
+
+async function showExportWarning(){
+  const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
+  const isWebCodecs = 'VideoEncoder' in window;
+  if(isMobile && !isWebCodecs){
+    warn.textContent = '⚠️ Mobiililaite + selain ilman WebCodecs-tukea. Suositus: tallenna .kol ja tee MP4 tietokoneella Chrome/Edgessä.';
+  } else {
+    warn.textContent = '';
+  }
+}
+
+async function exportVideo(){
+  showExportWarning();
+  if ('VideoEncoder' in window) {
+    return exportMP4_WebCodecs();
+  } else {
+    return exportMP4_FFmpeg();
+  }
+} else {
+    return exportMP4_FFmpeg();
+  }
+}
+
+// ⚡ Chrome / Edge – WebCodecs (nopea)
+async function exportMP4_WebCodecs(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  const frames = [];
+  const fps = 30;
+  const dur = Number(duration.value);
+  for(let i=0;i<fps*dur;i++){
+    draw(ctx, canvas);
+    frames.push(canvas.toDataURL('image/png'));
+    await new Promise(r=>setTimeout(r,1000/fps));
+  }
+  const chunks=[];
+  const encoder = new VideoEncoder({
+    output:chunk=>chunks.push(chunk),
+    error:e=>console.error(e)
+  });
+  encoder.configure({codec:'avc1.42E01E',width:w,height:h,bitrate:2_000_000,framerate:fps});
+  for(let i=0;i<frames.length;i++){
+    const img = await createImageBitmap(await (await fetch(frames[i])).blob());
+    const frame = new VideoFrame(img,{timestamp:i*1e6/fps});
+    encoder.encode(frame);
+    frame.close();
+  }
+  await encoder.flush();
+  const blob = new Blob(chunks.map(c=>c.byteLength?new Uint8Array(c.byteLength):c),{type:'video/mp4'});
+  download(blob,'kol.mp4');
+}
+
+
+// 🐢 Muut selaimet – ffmpeg.wasm (fallback)
+async function exportMP4_FFmpeg(){
+  if(!window.FFmpeg){
+    const s=document.createElement('script');
+    s.src='https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js';
+    document.body.appendChild(s);
+    await new Promise(r=>s.onload=r);
+  }
+  const { createFFmpeg, fetchFile } = FFmpeg;
+  const ffmpeg = createFFmpeg({ log: true });
+  await ffmpeg.load();
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const canvas=document.createElement('canvas');
+  canvas.width=w; canvas.height=h;
+  const ctx=canvas.getContext('2d');
+  const fps=30, dur=Number(duration.value);
+  for(let i=0;i<fps*dur;i++){
+    draw(ctx,canvas);
+    const name=`f${i}.png`;
+    ffmpeg.FS('writeFile',name,await fetchFile(canvas.toDataURL('image/png')));
+    await new Promise(r=>setTimeout(r,1000/fps));
+  }
+  await ffmpeg.run('-framerate','30','-i','f%d.png','-c:v','libx264','-pix_fmt','yuv420p','out.mp4');
+  const data = ffmpeg.FS('readFile','out.mp4');
+  download(new Blob([data.buffer],{type:'video/mp4'}),'kol.mp4');
+}{
+  alert('WebCodecs ei saatavilla. ffmpeg.wasm vaatii suuren kirjaston – lisätään seuraavassa vaiheessa.');
+}
+  requestAnimationFrame(frame);
+  rec.onstop = () => download(new Blob(chunks, { type: 'video/webm' }), 'kol.mp4');
+}
+
+function draw(ctx, c) {
+  ctx.fillStyle = stage.style.background || '#000';
+  ctx.fillRect(0, 0, c.width, c.height);
+  stage.querySelectorAll('img,video').forEach(el =>
+    ctx.drawImage(el, parseInt(el.style.left), parseInt(el.style.top), el.offsetWidth, el.offsetHeight)
+  );
+}
+
+function saveKOL() {
+  download(new Blob([JSON.stringify(serialize())]), 'project.kol');
+}
+
+kolInput.onchange = e => e.target.files[0].text().then(t => load(JSON.parse(t)));
+
+function serialize() {
+  return {
+    bg: stage.style.background,
+    layers: [...stage.children].map(l => ({
+      tag: l.tagName,
+      src: l.src,
+      x: l.style.left,
+      y: l.style.top,
+      w: l.style.width
+    }))
+  };
+}
+
+function load(d) {
+  stage.innerHTML = '';
+  layers = [];
+  stage.style.background = d.bg;
+  d.layers.forEach(o => {
+    const el = document.createElement(o.tag.toLowerCase());
+    el.src = o.src;
+    if (o.tag === 'VIDEO') {
+      el.autoplay = true;
+      el.loop = true;
+      el.muted = true;
+    }
+    el.className = 'layer';
+    el.style.left = o.x;
+    el.style.top = o.y;
+    el.style.width = o.w;
+    addHandles(el);
+    drag(el);
+    stage.appendChild(el);
+    layers.push(el);
+  });
+  refreshLayers();
+}
+
+function startLive() {
+  liveInfo.textContent = 'Live (pilvi)';
+  connectCloud();
+  update();
+}
+
+// ☁️ Väliaikainen pilvi (public echo WS demo)
+let ws;
+function connectCloud(){
+  ws = new WebSocket('wss://echo.websocket.events');
+  ws.onopen = ()=>liveInfo.textContent='Live (pilvi yhdistetty)';
+  ws.onmessage = e => {
+    try { load(JSON.parse(e.data)); } catch {}
+  };
+}
+
+
+function update(fn) {
+  if (fn) fn();
+  const data = serialize();
+  bc.postMessage(data);
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
+}
+
+bc.onmessage = e => load(e.data);
+
+function refreshLayers() {
+  layersDiv.innerHTML = '';
+  layers.forEach((l, i) => {
+    const b = document.createElement('button');
+    b.textContent = l.tagName + ' ' + i;
+    b.onclick = () => {
+      layers.forEach(x => x.style.zIndex = 0);
+      l.style.zIndex = 10;
+    };
+    layersDiv.appendChild(b);
+  });
+}
+
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+}
+</script>
+
+<script>
+const params = new URLSearchParams(location.search);
+if (params.get('viewer') === '1') {
+  document.querySelector('[data-ui]').style.display = 'none';
+  stage.style.width = '100vw';
+  stage.style.height = '100vh';
+  stage.requestFullscreen?.();
+}
+</script>
+</body>
+</html>
