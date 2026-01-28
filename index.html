@@ -4,12 +4,15 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>KOL Studio – Editor + Viewer</title>
-
 <style>
 body{margin:0;font-family:sans-serif;background:#0e0e0e;color:#eee;display:flex;height:100vh;touch-action:none}
 #ui{width:280px;background:#1b1b1b;padding:10px;display:flex;flex-direction:column;gap:8px}
 #stageWrap{flex:1;display:flex;justify-content:center;align-items:center}
 #stage{position:relative;width:640px;height:360px;background:#333;overflow:hidden}
+#stage.fullscreen{position:fixed;inset:0;width:100vw;height:100vh;z-index:1000}
+#stage.fit{object-fit:contain}
+#stage.fill{object-fit:cover}
+#stage.fullscreen{position:fixed;inset:0;width:100vw;height:100vh;z-index:1000}
 .layer{position:absolute;cursor:move;user-select:none;touch-action:none}
 input,button{background:#2a2a2a;color:#eee;border:1px solid #555;padding:6px}
 button:hover{background:#3a3a3a}
@@ -19,63 +22,73 @@ button:hover{background:#3a3a3a}
 </head>
 <body>
 
+<script>
+// Viewer mode detection
+const params = new URLSearchParams(location.search);
+const viewerMode = params.has('view');
+const autoFullscreen = params.has('fullscreen');
+const autoPlayLock = params.has('autoplay');
+const scaleMode = params.get('scale') || 'fit';
+const liveChannel = params.get('live');
+</script>
+
 <div id="ui" data-ui>
   <b>KOL Studio</b>
   <input type="color" id="bgColor">
   <input type="file" id="fileInput" accept="image/*,video/*,.kol" multiple>
   <label>Kesto (sek): <input type="number" id="duration" value="5" min="1"></label>
-  <button onclick="exportVideo()">🎥 Vie MP4 (auto)</button>
+  <button onclick="toggleFullscreen()">⛶ Fullscreen</button>
   <button onclick="saveKOL()">💾 Tallenna .kol</button>
-  <button onclick="startLive()">📺 Live</button>
-  <small id="liveInfo"></small>
-  <small id="warn" style="color:#ffb347"></small>
   <b>Layerit</b>
   <div id="layers"></div>
 </div>
 
+<script>
+if(viewerMode){
+  document.getElementById('ui').style.display='none';
+  if(autoFullscreen){ setTimeout(()=>toggleFullscreen(),300); }
+  if(autoPlayLock){ stage.addEventListener('click',e=>e.preventDefault()); }
+}
+}
+</script>
+</div>
+
 <div id="stageWrap"><div id="stage"></div></div>
+<script>
+if(scaleMode==='fill') stage.classList.add('fill'); else stage.classList.add('fit');
+</script>
 
 <script>
-// --- Vars ---
 const stage = document.getElementById('stage');
 const layersDiv = document.getElementById('layers');
 const bgColor = document.getElementById('bgColor');
 const fileInput = document.getElementById('fileInput');
-const duration = document.getElementById('duration');
-const liveInfo = document.getElementById('liveInfo');
-const warn = document.getElementById('warn');
 
 let layers = [];
-const bc = new BroadcastChannel('kol-live');
-let ws;
+let liveBC = liveChannel ? new BroadcastChannel('kol-live-'+liveChannel) : null;
+if(liveBC){ liveBC.onmessage = e => load(e.data); }
 
-// --- Background ---
-bgColor.oninput = () => update(() => stage.style.background = bgColor.value);
+bgColor.oninput = () => stage.style.background = bgColor.value;
 
-// --- File input ---
 fileInput.onchange = async e => {
   const files = [...e.target.files];
   for (const f of files) {
-    if(f.name.endsWith('.kol')) {
+    if (f.name.endsWith('.kol')) {
       const txt = await f.text();
       load(JSON.parse(txt));
       continue;
     }
 
-    const url = URL.createObjectURL(f);
-    let el;
-    if(f.type.startsWith('video')) {
-      el = document.createElement('video');
-      el.src = url;
+    const dataURL = await fileToDataURL(f);
+    const el = f.type.startsWith('video') ? document.createElement('video') : document.createElement('img');
+    el.dataset.name = f.name;
+    el.src = dataURL;
+    if (el.tagName === 'VIDEO') {
       el.autoplay = true;
       el.loop = true;
       el.muted = true;
       el.playsInline = true;
-    } else if(f.type.startsWith('image')) {
-      el = document.createElement('img');
-      el.src = url;
-    } else continue;
-
+    }
     el.className = 'layer';
     el.style.left = '50px';
     el.style.top = '50px';
@@ -86,169 +99,115 @@ fileInput.onchange = async e => {
     layers.push(el);
   }
   refreshLayers();
-  update();
 };
 
-// --- Drag ---
-function drag(el){
-  let x=0,y=0,startX=0,startY=0;
-  el.onpointerdown = e => {
-    startX = e.clientX;
-    startY = e.clientY;
-    el.setPointerCapture(e.pointerId);
-    el.onpointermove = p => {
-      x += p.clientX - startX;
-      y += p.clientY - startY;
-      startX = p.clientX;
-      startY = p.clientY;
-      el.style.transform = `translate(${x}px,${y}px)`;
-      update();
-    };
-    el.onpointerup = () => el.onpointermove=null;
-  };
-}
-
-// --- Resize ---
-function addHandles(el){
-  const h = document.createElement('div');
-  h.className='handle';
-  el.appendChild(h);
-  h.onpointerdown = e=>{
-    e.stopPropagation();
-    const startW=el.offsetWidth;
-    const sx=e.clientX;
-    h.setPointerCapture(e.pointerId);
-    h.onpointermove=p=>{
-      el.style.width=startW + (p.clientX - sx) + 'px';
-      update();
-    };
-    h.onpointerup = ()=>h.onpointermove=null;
-  };
-}
-
-// --- Warn for mobile without WebCodecs ---
-function showExportWarning(){
-  const isMobile = /Android|iPhone|iPad/i.test(navigator.userAgent);
-  const isWebCodecs = 'VideoEncoder' in window;
-  if(isMobile && !isWebCodecs){
-    warn.textContent = '⚠️ Mobiililaite + selain ilman WebCodecs-tukea. Suositus: tallenna .kol ja tee MP4 tietokoneella Chrome/Edgessä.';
-  } else warn.textContent='';
-}
-
-// --- Export MP4 ---
-async function exportVideo(){
-  showExportWarning();
-  if('VideoEncoder' in window) return exportMP4_WebCodecs();
-  else return exportMP4_FFmpeg();
-}
-
-async function exportMP4_WebCodecs(){
-  const w=stage.clientWidth,h=stage.clientHeight;
-  const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
-  const ctx=canvas.getContext('2d');
-  const frames=[]; const fps=30; const dur=Number(duration.value);
-  for(let i=0;i<fps*dur;i++){
-    draw(ctx,canvas);
-    frames.push(canvas.toDataURL('image/png'));
-    await new Promise(r=>setTimeout(r,1000/fps));
-  }
-  const chunks=[]; 
-  const encoder = new VideoEncoder({output:c=>chunks.push(c),error:e=>console.error(e)});
-  encoder.configure({codec:'avc1.42E01E',width:w,height:h,bitrate:2_000_000,framerate:fps});
-  for(let i=0;i<frames.length;i++){
-    const img = await createImageBitmap(await (await fetch(frames[i])).blob());
-    const frame = new VideoFrame(img,{timestamp:i*1e6/fps});
-    encoder.encode(frame); frame.close();
-  }
-  await encoder.flush();
-  const blob=new Blob(chunks.map(c=>c.byteLength?new Uint8Array(c.byteLength):c),{type:'video/mp4'});
-  download(blob,'kol.mp4');
-}
-
-async function exportMP4_FFmpeg(){
-  if(!window.FFmpeg){
-    const s=document.createElement('script'); s.src='https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js'; document.body.appendChild(s);
-    await new Promise(r=>s.onload=r);
-  }
-  const {createFFmpeg,fetchFile}=FFmpeg;
-  const ffmpeg=createFFmpeg({log:true});
-  await ffmpeg.load();
-  const w=stage.clientWidth,h=stage.clientHeight;
-  const canvas=document.createElement('canvas'); canvas.width=w; canvas.height=h;
-  const ctx=canvas.getContext('2d'); const fps=30,dur=Number(duration.value);
-  for(let i=0;i<fps*dur;i++){
-    draw(ctx,canvas);
-    const name=`f${i}.png`;
-    ffmpeg.FS('writeFile',name,await fetchFile(canvas.toDataURL('image/png')));
-    await new Promise(r=>setTimeout(r,1000/fps));
-  }
-  await ffmpeg.run('-framerate','30','-i','f%d.png','-c:v','libx264','-pix_fmt','yuv420p','out.mp4');
-  const data=ffmpeg.FS('readFile','out.mp4');
-  download(new Blob([data.buffer],{type:'video/mp4'}),'kol.mp4');
-}
-
-// --- Draw Stage ---
-function draw(ctx,c){
-  ctx.fillStyle=stage.style.background||'#000';
-  ctx.fillRect(0,0,c.width,c.height);
-  stage.querySelectorAll('img,video').forEach(el=>{
-    const rect=el.getBoundingClientRect();
-    ctx.drawImage(el, parseInt(el.style.left)||0, parseInt(el.style.top)||0, el.offsetWidth, el.offsetHeight);
+function fileToDataURL(file){
+  return new Promise(res=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result);
+    r.readAsDataURL(file);
   });
 }
 
-// --- .kol ---
-function saveKOL(){ download(new Blob([JSON.stringify(serialize())]),'project.kol'); }
-function serialize(){ return {bg:stage.style.background,layers:[...stage.children].map(l=>({tag:l.tagName,src:l.src,x:l.style.left,y:l.style.top,w:l.style.width}))}; }
+function drag(el){
+  let sx,sy,ox,oy;
+  el.onpointerdown=e=>{
+    ox=parseInt(el.style.left); oy=parseInt(el.style.top);
+    sx=e.clientX; sy=e.clientY;
+    el.setPointerCapture(e.pointerId);
+    el.onpointermove=p=>{
+      el.style.left = ox + (p.clientX-sx) + 'px'; broadcast();
+      el.style.top  = oy + (p.clientY-sy) + 'px';
+    };
+    el.onpointerup=()=>el.onpointermove=null;
+  };
+}
+
+function addHandles(el){
+  const h=document.createElement('div');
+  h.className='handle';
+  el.appendChild(h);
+  h.onpointerdown=e=>{
+    e.stopPropagation();
+    const w=el.offsetWidth; const h0=el.offsetHeight||el.offsetWidth; 
+    const sx=e.clientX, sy=e.clientY;
+    h.setPointerCapture(e.pointerId);
+    h.onpointermove=p=>{
+      el.style.width = w + (p.clientX-sx) + 'px'; broadcast();
+      el.style.height = h0 + (p.clientY-sy) + 'px';
+    };
+    h.onpointerup=()=>h.onpointermove=null;
+  };
+};
+}
+
+function broadcast(){ if(liveBC) liveBC.postMessage(serialize()); }
+
+function saveKOL(){
+  const data = serialize();
+  download(new Blob([JSON.stringify(data)],{type:'application/json'}),'projekti.kol');
+}
+
+function serialize(){
+  return {
+    bg: stage.style.background,
+    stage:{ w: stage.style.width || '640px', h: stage.style.height || '360px' },
+    layers: [...stage.children].map((l,i)=>({
+      name: l.dataset.name || (l.tagName+' '+i),
+      tag: l.tagName,
+      src: l.src,
+      x: l.style.left,
+      y: l.style.top,
+      w: l.style.width,
+      h: l.style.height || 'auto'
+    }))
+  };
+}
+
 function load(d){
   stage.innerHTML=''; layers=[];
   stage.style.background=d.bg;
+  if(d.stage){ stage.style.width=d.stage.w; stage.style.height=d.stage.h; }
   d.layers.forEach(o=>{
     const el=document.createElement(o.tag.toLowerCase());
     el.src=o.src;
-    if(o.tag==='VIDEO'){el.autoplay=true;el.loop=true;el.muted=true;el.playsInline=true;}
-    el.className='layer'; el.style.left=o.x; el.style.top=o.y; el.style.width=o.w;
+    el.dataset.name=o.name;
+    if(o.tag==='VIDEO'){
+      el.autoplay=true; el.loop=true; el.muted=true; el.playsInline=true;
+    }
+    el.className='layer';
+    el.style.left=o.x; el.style.top=o.y; el.style.width=o.w; if(o.h) el.style.height=o.h;
     addHandles(el); drag(el);
-    stage.appendChild(el); layers.push(el);
+    stage.appendChild(el); layers.push(el); broadcast();(el);
   });
   refreshLayers();
 }
 
-// --- Layer panel ---
 function refreshLayers(){
   layersDiv.innerHTML='';
   layers.forEach((l,i)=>{
-    const b=document.createElement('button'); b.textContent=l.tagName+' '+i;
-    b.onclick=()=>{ layers.forEach(x=>x.style.zIndex=0); l.style.zIndex=10; };
-    layersDiv.appendChild(b);
+    const wrap=document.createElement('div');
+    const name=document.createElement('input');
+    name.value=l.dataset.name||('Layer '+i);
+    name.oninput=()=>l.dataset.name=name.value;
+    const btn=document.createElement('button');
+    btn.textContent='Valitse';
+    btn.onclick=()=>{layers.forEach(x=>x.style.zIndex=0);l.style.zIndex=10;};
+    wrap.appendChild(name); wrap.appendChild(btn);
+    layersDiv.appendChild(wrap);
   });
 }
 
-// --- Download helper ---
-function download(blob,name){ const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); }
-
-// --- Live ---
-function startLive(){
-  liveInfo.textContent='Live (pilvi)';
-  connectCloud();
-  update();
+function toggleFullscreen(){
+  stage.classList.toggle('fullscreen');
 }
 
-function connectCloud(){
-  ws = new WebSocket('wss://echo.websocket.events');
-  ws.onopen = ()=>liveInfo.textContent='Live (pilvi yhdistetty)';
-  ws.onmessage = e => { try{ load(JSON.parse(e.data)); } catch{} };
+function download(blob,name){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=name;
+  a.click();
 }
-
-function update(fn){
-  if(fn) fn();
-  const data=serialize();
-  bc.postMessage(data);
-  if(ws && ws.readyState===1) ws.send(JSON.stringify(data));
-}
-
-bc.onmessage=e=>load(e.data);
-
 </script>
 </body>
 </html>
